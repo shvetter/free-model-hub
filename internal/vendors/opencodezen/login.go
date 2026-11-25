@@ -12,7 +12,7 @@ func (v *adapter) KeyURL() string { return "https://opencode.ai/auth" }
 
 // KeyNote implements core.KeyInfoProvider.
 func (v *adapter) KeyNote() string {
-	return "Not needed for free models: the keyless account already serves them. A Zen key only adds your own quota."
+	return "Optional for free models: requests use your Zen key when configured, or the public keyless credential otherwise."
 }
 
 // MaskedKey returns the masked key: keeping the first four and last four characters, with *** in the middle.
