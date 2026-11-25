@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -142,8 +143,8 @@ func TestModelsEndpointStripsOpenAILayer(t *testing.T) {
 	}
 }
 
-func TestNewChatRequestFreeTierUsesAnonymousCredential(t *testing.T) {
-	// mimo-v2.6-flash-free has a price of zero in the catalog, and based on unit price judgment, it should enter the free tier.
+func TestNewChatRequestFreeTierUsesConfiguredCredential(t *testing.T) {
+	// mimo-v2.6-flash-free has a price of zero in the catalog, so it enters the free request path.
 	catalog := modelsDevCatalog{
 		"mimo-v2.6-flash-free": {Cost: &modelsDevCost{}},
 	}
@@ -152,8 +153,8 @@ func TestNewChatRequestFreeTierUsesAnonymousCredential(t *testing.T) {
 	if errReq != nil {
 		t.Fatalf("newChatRequest: %v", errReq)
 	}
-	if got := req.Header.Get("Authorization"); got != "Bearer "+freeTierCredential {
-		t.Fatalf("free tier credential = %q, expected anonymous credential", got)
+	if got := req.Header.Get("Authorization"); got != "Bearer oc_sk_secret" {
+		t.Fatalf("free tier credential = %q, expected configured Zen API key", got)
 	}
 	if got := req.URL.String(); got != DefaultBaseURL+ChatPath {
 		t.Fatalf("free tier egress = %q", got)
@@ -170,6 +171,91 @@ func TestNewChatRequestFreeTierUsesAnonymousCredential(t *testing.T) {
 	// The official client only passes through session-owned tools and does not supplement them by model; this confirms we do not inject them.
 	if _, ok := payload["tools"]; ok {
 		t.Fatal("free tier should not inject tool definitions")
+	}
+}
+
+// Keyless accounts must retain access to the public free lane when no user key is configured.
+func TestNewChatRequestKeylessFreeTierUsesPublicCredential(t *testing.T) {
+	catalog := modelsDevCatalog{"mimo-v2.6-flash-free": {Cost: &modelsDevCost{}}}
+	body := []byte(`{"model":"mimo-v2.6-flash-free","messages":[{"role":"user","content":"hi"}]}`)
+	req, errReq := newChatRequest(context.Background(), "", ChatRequest{Body: body}, catalog)
+	if errReq != nil {
+		t.Fatalf("newChatRequest: %v", errReq)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer "+freeTierCredential {
+		t.Fatalf("keyless free tier credential = %q, expected public credential", got)
+	}
+}
+
+// TestFreeLaneRetriesOnClientGateOnly locks down the dual-credential free lane.
+//
+// A configured key is tried first; the public credential is only a fallback for the gateway's own client-gate
+// verdicts. A broken key (401), a provider fault (500) or a transient error must never borrow the keyless lane.
+func TestFreeLaneRetriesOnClientGateOnly(t *testing.T) {
+	catalog := modelsDevCatalog{"mimo-v2.6-flash-free": {Cost: &modelsDevCost{}}}
+	const free = "mimo-v2.6-flash-free"
+	key := "oc_sk_secret"
+
+	retry := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"429 free usage limit", 429, `{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached."}}`},
+		{"403 free tier error", 403, `{"type":"error","error":{"type":"FreeTierError","message":"OpenCode's free tier can only be used from within OpenCode."}}`},
+	}
+	for _, tc := range retry {
+		if !shouldRetryWithPublic(free, catalog, key, Classify(tc.status, tc.body)) {
+			t.Errorf("%s: should retry on the public credential", tc.name)
+		}
+	}
+
+	noRetry := []struct {
+		name       string
+		model      string
+		credential string
+		status     int
+		body       string
+	}{
+		{"invalid key", free, key, 401, `{"error":{"message":"Missing API key"}}`},
+		{"server fault", free, key, 500, `{"error":{"message":"boom"}}`},
+		{"plain rate limit", free, key, 429, `{"error":{"message":"slow down"}}`},
+		{"already public", free, freeTierCredential, 429, `{"type":"FreeUsageLimitError"}`},
+		{"keyless account", free, "", 429, `{"type":"FreeUsageLimitError"}`},
+		{"paid model", "glm-5.3", key, 429, `{"type":"FreeUsageLimitError"}`},
+	}
+	for _, tc := range noRetry {
+		if shouldRetryWithPublic(tc.model, catalog, tc.credential, Classify(tc.status, tc.body)) {
+			t.Errorf("%s: must not retry on the public credential", tc.name)
+		}
+	}
+}
+
+// TestTraceHeadersMatchRequestID locks down the identity headers added beside the session pair.
+func TestTraceHeadersMatchRequestID(t *testing.T) {
+	catalog := modelsDevCatalog{"mimo-v2.6-flash-free": {Cost: &modelsDevCost{}}}
+	body := []byte(`{"model":"mimo-v2.6-flash-free","messages":[{"role":"user","content":"hi"}]}`)
+	req, errReq := newChatRequest(context.Background(), "", ChatRequest{APIKey: "oc_sk_secret", Body: body}, catalog)
+	if errReq != nil {
+		t.Fatalf("newChatRequest: %v", errReq)
+	}
+
+	requestID := req.Header.Get("x-opencode-request")
+	if requestID != req.Header.Get("x-opencode-request-id") {
+		t.Fatalf("request id headers disagree: %q vs %q", requestID, req.Header.Get("x-opencode-request-id"))
+	}
+	if !canonicalMessagePattern.MatchString(requestID) {
+		t.Fatalf("request id %q does not match the official msg_ shape", requestID)
+	}
+
+	// b3 and traceparent must share the same trace and span ids.
+	b3 := strings.Split(req.Header.Get("b3"), "-")
+	traceparent := strings.Split(req.Header.Get("traceparent"), "-")
+	if len(b3) != 3 || len(traceparent) != 4 {
+		t.Fatalf("malformed tracing headers: %q / %q", req.Header.Get("b3"), req.Header.Get("traceparent"))
+	}
+	if b3[0] != traceparent[1] || b3[1] != traceparent[2] {
+		t.Fatalf("tracing headers disagree: b3=%q traceparent=%q", req.Header.Get("b3"), req.Header.Get("traceparent"))
 	}
 }
 
