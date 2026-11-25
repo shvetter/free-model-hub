@@ -25,9 +25,8 @@ import (
 // Differences from WorkBuddy / Qoder: ZEN upstream is standard OpenAI chat-completions.
 // Special requirements (referencing opencode2api and the official OpenCode implementation):
 //   1. Session ID must be in canonical session format: `ses_` + 12-digit hex + 14-character Base62.
-//   2. Free-tier models (IDs containing "free") require the full official Agent request format: route via inference lane,
-//      authenticate with anonymous public credentials, stream=true, and declare the official OpenCode toolset
-//      (see assets/free-tier-tools.json).
+//   2. Free-tier models require the official request format: route via the inference lane, stream=true, and use the
+//      configured Zen API key when present (falling back to the public credential for keyless accounts).
 //      Non-streaming calls automatically enable stream in the plugin and combine into a standard JSON response via CollapseSSEToJSON after upstream returns.
 
 // chatHTTPTimeout is the limit for non-streaming chats.
@@ -35,7 +34,7 @@ const chatHTTPTimeout = 10 * time.Minute
 
 // ChatRequest is the input for a chat forwarding operation.
 type ChatRequest struct {
-	// APIKey is the outbound credential for paid models; free tier uses anonymous public credentials instead.
+	// APIKey is the outbound Zen credential. Free-tier requests use it when present, or public for keyless accounts.
 	APIKey string
 	// Body is the chat-completions request body translated by the host.
 	Body []byte
@@ -80,10 +79,33 @@ func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) 
 }
 
 // ChatStream executes a streaming chat, returning the upstream response body (caller is responsible for closing).
+//
+// The free lane is dual-credential: the attempt uses the account's own Zen key, and if the gateway answers with its
+// client-gate verdict (403 FreeTierError / 429 FreeUsageLimitError) the same request is retried once on the public
+// credential. Neither lane is guaranteed to pass the gate; retrying keeps both options available instead of betting
+// on one.
 func ChatStream(ctx context.Context, baseURL string, req ChatRequest) (*http.Response, error) {
-	httpReq, errReq := newChatRequest(ctx, baseURL, req, req.Catalog)
+	credential := freeLaneCredential(req.APIKey)
+	resp, failure := streamAttempt(ctx, baseURL, req, credential)
+	if failure == nil {
+		return resp, nil
+	}
+	if !shouldRetryWithPublic(extractModelName(req.Body), req.Catalog, credential, failure) {
+		return nil, failure
+	}
+	retryResp, retryFailure := streamAttempt(ctx, baseURL, req, freeTierCredential)
+	if retryFailure != nil {
+		return nil, retryFailure
+	}
+	return retryResp, nil
+}
+
+// streamAttempt performs one streaming attempt with an explicit credential.
+func streamAttempt(ctx context.Context, baseURL string, req ChatRequest, credential string) (*http.Response, *core.Failure) {
+	httpReq, errReq := newChatRequestWith(ctx, baseURL, req, req.Catalog, credential)
 	if errReq != nil {
-		return nil, errReq
+		// Never return (nil, nil): the caller treats a nil failure as success and would dereference a nil response.
+		return nil, &core.Failure{Msg: "chat stream: " + errReq.Error(), Kind: core.FailureKindTransient}
 	}
 
 	resp, errDo := hostbridge.StreamClient(ctx, 0).Do(httpReq)
@@ -98,9 +120,9 @@ func ChatStream(ctx context.Context, baseURL string, req ChatRequest) (*http.Res
 	return resp, nil
 }
 
-// doChat initiates a non-streaming chat request.
+// doChat initiates a non-streaming chat request (paid lane, single credential).
 func doChat(ctx context.Context, baseURL string, req ChatRequest) (*http.Response, error) {
-	httpReq, errReq := newChatRequest(ctx, baseURL, req, req.Catalog)
+	httpReq, errReq := newChatRequestWith(ctx, baseURL, req, req.Catalog, freeLaneCredential(req.APIKey))
 	if errReq != nil {
 		return nil, errReq
 	}
@@ -112,16 +134,52 @@ func doChat(ctx context.Context, baseURL string, req ChatRequest) (*http.Respons
 	return resp, nil
 }
 
-// newChatRequest assembles a chat-completions request (shared by streaming and non-streaming).
+// freeLaneCredential picks the credential for an attempt: the account's Zen key when present,
+// otherwise the public keyless credential.
+func freeLaneCredential(apiKey string) string {
+	if trimmed := strings.TrimSpace(apiKey); trimmed != "" {
+		return trimmed
+	}
+	return freeTierCredential
+}
+
+// shouldRetryWithPublic reports whether a failed attempt deserves one retry on the public credential.
 //
-// Free and paid use the same inference lane, differing only in credentials: free uses anonymous public,
-// and paid uses the user key. Whether it is free is determined by the models.dev catalog unit price, see isFreeTierModel.
+// Deliberately narrow: free-tier models only, a real user key only, and only the gateway's own client-gate
+// verdicts. Transient failures, 5xx, 400s and credential errors are never retried, so a broken key does not
+// silently borrow the keyless lane.
+func shouldRetryWithPublic(model string, catalog modelsDevCatalog, credential string, failure *core.Failure) bool {
+	if failure == nil || !isFreeTierModel(model, catalog) {
+		return false
+	}
+	if strings.TrimSpace(credential) == "" || credential == freeTierCredential {
+		return false
+	}
+	switch failure.Status {
+	case http.StatusForbidden:
+		return strings.Contains(failure.Msg, "FreeTierError")
+	case http.StatusTooManyRequests:
+		return strings.Contains(failure.Msg, "FreeUsageLimitError") || strings.Contains(failure.Msg, "Free usage limit")
+	default:
+		return false
+	}
+}
+
+// newChatRequest assembles a chat-completions request (shared by streaming and non-streaming).
 func newChatRequest(ctx context.Context, baseURL string, req ChatRequest, catalog modelsDevCatalog) (*http.Request, error) {
+	return newChatRequestWith(ctx, baseURL, req, catalog, freeLaneCredential(req.APIKey))
+}
+
+// newChatRequestWith assembles a request with an explicit credential, so the free lane can retry with another one.
+//
+// Free and paid share the same inference lane; tier is decided by catalog unit price, not by the credential.
+func newChatRequestWith(ctx context.Context, baseURL string, req ChatRequest, catalog modelsDevCatalog, credential string) (*http.Request, error) {
 	body := req.Body
-	credential := req.APIKey
 	if isFreeTierModel(extractModelName(body), catalog) {
 		body = prepareFreeTierBody(body)
-		credential = freeTierCredential
+		if strings.TrimSpace(credential) == "" {
+			credential = freeTierCredential
+		}
 	} else {
 		body = normalizeMaxTokens(body)
 	}
@@ -131,6 +189,7 @@ func newChatRequest(ctx context.Context, baseURL string, req ChatRequest, catalo
 		return nil, fmt.Errorf("build chat request: %w", errReq)
 	}
 	ApplyChatHeaders(httpReq, credential, sessionIDFor(body))
+	applyTraceHeaders(httpReq, body)
 	return httpReq, nil
 }
 
@@ -165,8 +224,7 @@ func normalizeMaxTokens(body []byte) []byte {
 
 // chatEndpoint returns the full URL for chat-completions.
 //
-// Free and paid share the same egress (this is how official v2 splits credentials), so it is no longer tiered by
-// whether it is free.
+// Free and paid share the same egress; the credential determines whether a free request uses the user's key or the public lane.
 func chatEndpoint(override string) string {
 	return BaseURL(override) + ChatPath
 }
@@ -550,6 +608,34 @@ func descendingTimePart(hash []byte) string {
 	})
 }
 
+// canonicalMessagePattern matches the official per-request message id shape: "msg_" + 12 hex + 14 Base62.
+var canonicalMessagePattern = regexp.MustCompile(`^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
+
+// messageIDFor derives the per-request message id from the same conversation seed as the session id, so a retry of
+// the same conversation keeps a stable identity instead of minting a new one per attempt.
+func messageIDFor(body []byte) string {
+	return canonicalMessageID(sessionIDFor(body))
+}
+
+// canonicalMessageID re-encodes any signal into the official ascending message id format.
+func canonicalMessageID(signal string) string {
+	sum := sha256.Sum256([]byte("msg\x00" + signal))
+	return "msg_" + ascendingTimePart(sum[:6]) + base62Fixed(new(big.Int).SetBytes(sum[6:16]), 14)
+}
+
+// ascendingTimePart renders six hash bytes as Identifier.ascending(): timestamp in the high bits, counter 1 in the low
+// bits, no inversion (sessions use the descending variant).
+func ascendingTimePart(hash []byte) string {
+	value := (uint64(hash[0])<<28 | uint64(hash[1])<<20 | uint64(hash[2])<<12 |
+		uint64(hash[3])<<4 | uint64(hash[4])>>4) << 12
+	value |= 1
+	return hex.EncodeToString([]byte{
+		byte(value >> 40), byte(value >> 32), byte(value >> 24),
+		byte(value >> 16), byte(value >> 8), byte(value),
+	})
+}
+
+// base62Fixed encodes n as a fixed-width Base62 string.
 func base62Fixed(n *big.Int, width int) string {
 	base := big.NewInt(62)
 	out := make([]byte, width)
@@ -590,8 +676,7 @@ const (
 	ModelsBaseURL = "https://opencode.ai/inference"
 	// ModelsPath is the path for the model list.
 	ModelsPath = "/v1/models"
-	// freeTierCredential is the anonymous credential used by the official client for the free tier:
-	// Paid keys will be rejected on this lane (observed 401 Missing API key in practice).
+	// freeTierCredential is the anonymous credential used when accessing the free tier without a saved Zen API key.
 	freeTierCredential = "public"
 
 	// clientVersion is the spoofed OpenCode client version, aligned with v2 stable.
@@ -664,4 +749,21 @@ func ApplyModelsHeaders(req *http.Request, apiKey string) {
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("User-Agent", UserAgent())
 	req.Header.Set("x-opencode-client", clientName)
+}
+
+// applyTraceHeaders adds the per-request identifiers the v2 client sends beside the session pair.
+//
+// Identity metadata only: no prompt, tool or body manipulation. The v2 gateway fingerprints the whole request
+// identity, and the missing request/trace ids were one of the differences between CLI traffic and other clients.
+func applyTraceHeaders(req *http.Request, body []byte) {
+	requestID := messageIDFor(body)
+	req.Header.Set("x-opencode-request", requestID)
+	req.Header.Set("x-opencode-request-id", requestID)
+
+	// b3 and traceparent must agree on the same trace/span ids; mismatched pairs are rejected by tracing validation.
+	sum := sha256.Sum256([]byte("trace\x00" + requestID))
+	traceID := hex.EncodeToString(sum[:16])
+	spanID := hex.EncodeToString(sum[16:24])
+	req.Header.Set("b3", traceID+"-"+spanID+"-1")
+	req.Header.Set("traceparent", "00-"+traceID+"-"+spanID+"-01")
 }
